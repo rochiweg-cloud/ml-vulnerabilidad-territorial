@@ -1,0 +1,26 @@
+# Datos (no subir por tamaño/confidencialidad)
+data/*.csv
+data/*.rds
+!data/README.md
+
+# Modelos entrenados (muy pesados)
+outputs/*.rds
+
+# Archivos de R
+.Rhistory
+.Rdata
+.Ruserdata
+.RData
+
+# Archivos de RStudio
+.Rproj.user/
+*.Rproj
+
+# Archivos temporales
+*~
+*.swp
+*.swo
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

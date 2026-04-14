@@ -1,0 +1,641 @@
+---
+title: "Predicción de Vulnerabilidad Territorial con Machine Learning"
+author: "Rocío Wegman"
+date: "2024-2025"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+# 1. Configuración del Entorno
+
+## 1.1 Carga de librerías
+
+```{r setup, message=FALSE, warning=FALSE}
+# Librerías principales
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+
+# Procesamiento espacial
+library(sf)
+library(purrr)
+
+# Modelado
+library(rpart)
+library(ranger)
+library(xgboost)
+
+# Interpretabilidad
+library(vip)
+library(DALEXtra)
+
+# Paralelización
+library(future)
+```
+
+## 1.2 Carga de datos
+
+```{r carga-datos, eval=FALSE}
+# Bases de datos
+# Nota: Ajustar rutas según ubicación local de los archivos
+radios_hogar <- read_csv("data/radios_hogar.csv")
+vuln_sanit <- read_csv("data/vuln_sanit.csv")
+env_eph <- read_csv("data/env_eph.csv")
+establecimientos <- read_csv("data/distribucion_establecimientos_productivos_sexo.csv")
+```
+
+# 2. Exploración de Datos
+
+## 2.1 Análisis de variables objetivo
+
+```{r exploracion, eval=FALSE}
+# Estadísticas descriptivas de tiempos de acceso a salud
+vuln_sanit %>%
+  select(tpo_hospital, tpo_ctro_salud) %>%
+  summary()
+```
+
+## 2.2 Visualización de distribuciones
+
+```{r visualizacion-distribucion, eval=FALSE}
+# Histograma: tiempo a hospitales
+vuln_sanit %>% 
+  ggplot(aes(x = tpo_hospital)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribución de tiempo a hospitales", 
+    x = "Minutos", 
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+# Histograma: tiempo a centros de salud
+vuln_sanit %>% 
+  ggplot(aes(x = tpo_ctro_salud)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white") +
+  labs(
+    title = "Distribución de tiempo a centros de salud", 
+    x = "Minutos", 
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+# Boxplots comparativos
+vuln_sanit %>%
+  pivot_longer(cols = c(tpo_hospital, tpo_ctro_salud)) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(fill = "tomato", outlier.color = "black") +
+  labs(
+    title = "Boxplots de tiempos de acceso", 
+    x = "Variable", 
+    y = "Minutos"
+  ) +
+  theme_minimal()
+```
+
+# 3. Preprocesamiento
+
+## 3.1 Preparación de claves para joins
+
+```{r preparacion-claves, eval=FALSE}
+# Convertir claves a texto para evitar errores de merge
+radios_hogar <- radios_hogar %>%
+  mutate(radio = as.character(radio))
+
+vuln_sanit <- vuln_sanit %>%
+  mutate(link = as.character(link))
+
+# Construir clave de radio en EPH
+env_eph <- env_eph %>%
+  mutate(
+    radio = paste0(
+      sprintf("%02s", codprov),
+      sprintf("%03s", coddepto),
+      sprintf("%02s", frac2010),
+      sprintf("%02s", radio2010)
+    )
+  )
+```
+
+## 3.2 Integración de bases de datos
+
+```{r integracion, eval=FALSE}
+# Join de aglomerados a vulnerabilidad sanitaria
+vuln_sanit <- vuln_sanit %>%
+  left_join(env_eph, by = c("link" = "radio")) %>%
+  group_by(link) %>%
+  slice(1) %>%  # Eliminar duplicados
+  ungroup()
+
+# Filtrar solo radios urbanos
+vuln_sanit <- vuln_sanit %>%
+  filter(!is.na(aglomerado))
+```
+
+## 3.3 Tratamiento de outliers
+
+```{r outliers, eval=FALSE}
+# Calcular percentiles 99.5 para filtrar outliers extremos
+cuantiles <- vuln_sanit %>%
+  summarise(
+    hospital_p995 = quantile(tpo_hospital, 0.995, na.rm = TRUE),
+    ctro_p995 = quantile(tpo_ctro_salud, 0.995, na.rm = TRUE)
+  )
+
+# Aplicar filtros
+vuln_sanit <- vuln_sanit %>%
+  filter(
+    !is.na(tpo_hospital),
+    !is.na(tpo_ctro_salud),
+    tpo_hospital <= cuantiles$hospital_p995,
+    tpo_ctro_salud <= cuantiles$ctro_p995
+  )
+```
+
+## 3.4 Procesamiento espacial
+
+```{r espacial, eval=FALSE}
+# Convertir a objeto sf y reparar geometrías inválidas
+vuln_sanit <- vuln_sanit %>%
+  mutate(geometry = st_as_sfc(geometry)) %>%
+  st_as_sf(crs = 4326)
+
+# Reparar geometrías problemáticas
+geoms_reparadas <- map2(
+  vuln_sanit$geometry,
+  st_is_valid(vuln_sanit),
+  ~ if (.y) .x else st_make_valid(.x)
+)
+
+vuln_sanit$geometry <- st_sfc(geoms_reparadas, crs = 4326)
+vuln_sanit <- st_as_sf(vuln_sanit, crs = 4326)
+```
+
+## 3.5 Agregación de establecimientos productivos
+
+```{r establecimientos, eval=FALSE}
+# Join espacial: establecimientos a radios censales
+establecimientos <- establecimientos %>%
+  filter(!is.na(lat) & !is.na(lon)) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+establecimientos <- st_join(
+  establecimientos,
+  radios_hogar %>% select(radio, everything()),
+  join = st_within
+)
+
+# Resumir variables por radio
+establecimientos <- establecimientos %>%
+  filter(!is.na(radio)) %>%
+  st_drop_geometry() %>%
+  group_by(radio) %>%
+  summarise(
+    cant_establecimientos = n(),
+    proporcion_mujeres = mean(proporcion_mujeres, na.rm = TRUE),
+    quintil_modal = as.numeric(names(sort(table(quintil), decreasing = TRUE)[1])),
+    empleo_total = sum(case_when(
+      empleo == "a. 1-9" ~ 5,
+      empleo == "b. 10-49" ~ 30,
+      empleo == "c. 50-199" ~ 125,
+      empleo == "d. 200 o más" ~ 300,
+      TRUE ~ NA_real_
+    ), na.rm = TRUE),
+    clae6_modal = as.numeric(names(sort(table(clae6), decreasing = TRUE)[1]))
+  )
+```
+
+## 3.6 Construcción del dataset final
+
+```{r dataset-final, eval=FALSE}
+# Unir todas las fuentes
+df <- radios_hogar %>%
+  filter(!is.na(aglomerado)) %>%
+  left_join(establecimientos, by = "radio") %>%
+  mutate(
+    # Imputar valores faltantes
+    cant_establecimientos = replace_na(cant_establecimientos, 0),
+    empleo_total = replace_na(empleo_total, 0),
+    proporcion_mujeres = replace_na(proporcion_mujeres, NA_real_),
+    quintil_modal = replace_na(quintil_modal, NA_real_),
+    clae6_modal = replace_na(clae6_modal, NA_real_)
+  ) %>%
+  st_drop_geometry()
+
+# Verificar dimensiones
+cat("Observaciones:", nrow(df), "\n")
+cat("Radios únicos:", n_distinct(df$radio), "\n")
+```
+
+## 3.7 Variable: distancia al centroide del aglomerado
+
+```{r distancia-centroide, eval=FALSE}
+# Reproyectar a sistema métrico para cálculo de distancias
+vuln_proj <- vuln_sanit %>%
+  filter(!is.na(aglomerado)) %>%
+  st_transform(3857)
+
+# Calcular centroides por aglomerado
+centroides <- vuln_proj %>%
+  group_by(aglomerado) %>%
+  summarise(geometry = st_centroid(st_union(geometry))) %>%
+  ungroup()
+
+# Extraer coordenadas
+centroides_coords <- centroides %>%
+  mutate(geometry_centroide = geometry) %>%
+  st_set_geometry(NULL)
+
+# Calcular distancia de cada radio al centroide de su aglomerado
+vuln_proj <- vuln_proj %>%
+  rename(geometry_radio = geometry)
+
+vuln_dist <- vuln_proj %>%
+  left_join(centroides_coords, by = "aglomerado") %>%
+  mutate(
+    distancia_centroide_km = as.numeric(
+      st_distance(geometry_radio, geometry_centroide, by_element = TRUE)
+    ) / 1000
+  )
+
+# Agregar al dataset principal
+vuln_dist <- vuln_dist %>%
+  st_drop_geometry() %>%
+  group_by(link) %>%
+  summarise(distancia_centroide_km = mean(distancia_centroide_km, na.rm = TRUE))
+
+df <- df %>%
+  left_join(vuln_dist, by = c("radio" = "link")) %>%
+  mutate(log_distancia_centroide = log1p(distancia_centroide_km))
+```
+
+# 4. Reducción de Dimensionalidad (PCA)
+
+## 4.1 Análisis de Componentes Principales
+
+```{r pca, eval=FALSE}
+# Variables de vulnerabilidad sanitaria para PCA
+vars_pca <- c("tpo_hospital", "tpo_ctro_salud")
+
+# Recipe para PCA
+receta_pca <- recipe(~ ., data = df %>% select(all_of(vars_pca))) %>%
+  step_normalize(all_numeric()) %>%
+  step_pca(all_numeric(), num_comp = 2, id = "pca")
+
+# Estimar PCA
+pca_estimates <- prep(receta_pca)
+
+# Aplicar transformación
+df <- bake(pca_estimates, new_data = df)
+
+# Visualizar cargas factoriales
+plot_cargas <- tidy(pca_estimates, 2, type = "coef") %>%
+  filter(component %in% c("PC1", "PC2")) %>%
+  ggplot(aes(value, terms, fill = terms)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = round(value, 2))) +
+  labs(
+    title = "Cargas Factoriales del PCA", 
+    x = "Valor", 
+    y = "Variable"
+  ) +
+  facet_wrap(~component, nrow = 1) +
+  theme_minimal()
+
+print(plot_cargas)
+
+# Varianza explicada
+plot_varianza <- tidy(pca_estimates, 2, type = "variance") %>%
+  filter(terms == "percent variance") %>%
+  mutate(component = paste0("PC", component)) %>%
+  ggplot(aes(x = component, y = value, group = terms)) +
+  geom_col(fill = "steelblue") +
+  ylim(0, 100) +
+  labs(
+    title = "Varianza Explicada por Componente", 
+    x = "Componente", 
+    y = "% Varianza"
+  ) +
+  theme_minimal()
+
+print(plot_varianza)
+```
+
+# 5. Modelado con Machine Learning
+
+## 5.1 Partición de datos
+
+```{r split, eval=FALSE}
+set.seed(123)
+
+# Split 80/20
+split <- initial_split(df, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+
+cat("Observaciones en train:", nrow(train), "\n")
+cat("Observaciones en test:", nrow(test), "\n")
+```
+
+## 5.2 Definición de la fórmula
+
+```{r formula, eval=FALSE}
+# Variable objetivo: PC1 (índice de vulnerabilidad sanitaria)
+formula_pca <- as.formula(
+ "PC1 ~ aglomerado + log_distancia_centroide + banio_uso_exclusivo + 
+  agua_canieria_dentro + agua_de_red + cocina_gas_red + desague_red_cloaca + 
+  tiene_bano_o_letrina_si + inodoro_con_cadena + regimen_tenencia_propietario + 
+  hogares_sin_nbi + cant_establecimientos + proporcion_mujeres + 
+  quintil_modal + empleo_total + clae6_modal"
+)
+```
+
+## 5.3 Configuración de validación cruzada
+
+```{r cv, eval=FALSE}
+set.seed(123)
+folds <- vfold_cv(train, v = 5)
+
+# Habilitar paralelización
+plan(multisession, workers = 4)
+```
+
+## 5.4 Recipe con interacciones
+
+```{r recipe, eval=FALSE}
+receta_interact <- recipe(formula_pca, data = train) %>%
+  # Manejar niveles nuevos en test
+  step_novel(all_nominal_predictors()) %>%
+  # Crear dummies para variables categóricas
+  step_dummy(all_nominal_predictors()) %>%
+  # Interacciones aglomerado × distancia
+  step_interact(terms = ~ starts_with("aglomerado_"):log_distancia_centroide) %>%
+  # Eliminar predictores con varianza cero
+  step_zv(all_predictors()) %>%
+  # Normalizar predictores numéricos
+  step_normalize(all_numeric_predictors())
+
+# Workflow base
+wf <- workflow() %>%
+  add_recipe(receta_interact)
+```
+
+# 6. Random Forest
+
+## 6.1 Especificación del modelo
+
+```{r rf-spec, eval=FALSE}
+random_forest <- rand_forest(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_mode("regression") %>%
+  set_engine("ranger", importance = "permutation")
+
+# Workflow
+tree_rf <- wf %>%
+  add_model(random_forest)
+```
+
+## 6.2 Tuning de hiperparámetros
+
+```{r rf-tuning, eval=FALSE}
+# Grilla de búsqueda
+grid_rf <- expand.grid(
+  trees = c(300, 500, 700),
+  mtry = c(15, 30, 45, 60),
+  min_n = c(20, 50, 100)
+)
+
+# Tuning con validación cruzada
+tree_rs_rf <- tree_rf %>%
+  tune_grid(
+    resamples = folds,
+    grid = grid_rf,
+    metrics = metric_set(rmse, mae, mape)
+  )
+
+# Seleccionar mejor modelo
+best_model_rf <- select_best(tree_rs_rf, metric = "rmse")
+final_model_rf <- finalize_model(random_forest, best_model_rf)
+
+cat("Mejores hiperparámetros Random Forest:\n")
+print(best_model_rf)
+```
+
+## 6.3 Entrenamiento final
+
+```{r rf-final, eval=FALSE}
+final_fit_rf <- tree_rf %>%
+  update_model(final_model_rf) %>%
+  fit(data = train)
+
+# Guardar modelo
+saveRDS(final_fit_rf, file = "outputs/modelo_random_forest.rds")
+```
+
+## 6.4 Evaluación
+
+```{r rf-eval, eval=FALSE}
+# Predicciones
+pred_train_rf <- predict(final_fit_rf, new_data = train) %>%
+  bind_cols(train %>% select(PC1))
+
+pred_test_rf <- predict(final_fit_rf, new_data = test) %>%
+  bind_cols(test %>% select(PC1))
+
+# Métricas
+mis_metricas <- metric_set(rmse, mae, mape)
+
+metricas_rf <- bind_rows(
+  mis_metricas(pred_train_rf, truth = PC1, estimate = .pred) %>%
+    mutate(conjunto = "Entrenamiento"),
+  mis_metricas(pred_test_rf, truth = PC1, estimate = .pred) %>%
+    mutate(conjunto = "Test")
+) %>%
+  select(conjunto, .metric, .estimate)
+
+cat("\nMétricas Random Forest:\n")
+print(metricas_rf)
+```
+
+# 7. XGBoost (Gradient Boosting)
+
+## 7.1 Especificación del modelo
+
+```{r xgb-spec, eval=FALSE}
+bt_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+# Workflow
+boosting_wf <- workflow() %>%
+  add_recipe(receta_interact) %>%
+  add_model(bt_spec)
+```
+
+## 7.2 Tuning de hiperparámetros
+
+```{r xgb-tuning, eval=FALSE}
+# Grilla de búsqueda (space-filling design)
+grid_bt <- grid_space_filling(
+  trees(),
+  tree_depth(),
+  min_n(),
+  learn_rate(range = c(0.01, 0.3)),
+  loss_reduction(),
+  finalize(mtry(), train),
+  size = 50
+)
+
+# Tuning
+tune_bt <- boosting_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = grid_bt,
+    metrics = metric_set(rmse, rsq, mae, mape)
+  )
+
+# Seleccionar mejor modelo
+best_model_bt <- select_best(tune_bt, metric = "rmse")
+final_model_bt <- finalize_model(bt_spec, best_model_bt)
+
+cat("Mejores hiperparámetros XGBoost:\n")
+print(best_model_bt)
+```
+
+## 7.3 Entrenamiento final
+
+```{r xgb-final, eval=FALSE}
+final_fit_bt <- boosting_wf %>%
+  update_model(final_model_bt) %>%
+  fit(data = train)
+
+# Guardar modelo
+saveRDS(final_fit_bt, file = "outputs/modelo_boosting.rds")
+```
+
+## 7.4 Evaluación
+
+```{r xgb-eval, eval=FALSE}
+# Predicciones
+pred_train_bt <- predict(final_fit_bt, new_data = train) %>%
+  bind_cols(train %>% select(PC1))
+
+pred_test_bt <- predict(final_fit_bt, new_data = test) %>%
+  bind_cols(test %>% select(PC1))
+
+# Métricas
+metricas_bt <- bind_rows(
+  mis_metricas(pred_train_bt, truth = PC1, estimate = .pred) %>%
+    mutate(conjunto = "Entrenamiento"),
+  mis_metricas(pred_test_bt, truth = PC1, estimate = .pred) %>%
+    mutate(conjunto = "Test")
+) %>%
+  select(conjunto, .metric, .estimate)
+
+cat("\nMétricas XGBoost:\n")
+print(metricas_bt)
+```
+
+# 8. Comparación de Modelos
+
+## 8.1 Comparación de métricas
+
+```{r comparacion, eval=FALSE}
+# Unir métricas de ambos modelos
+metricas_rf <- metricas_rf %>% mutate(modelo = "Random Forest")
+metricas_bt <- metricas_bt %>% mutate(modelo = "XGBoost")
+metricas_comparadas <- bind_rows(metricas_rf, metricas_bt)
+
+# Gráfico comparativo de RMSE
+metricas_comparadas %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = modelo, y = .estimate, fill = modelo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ conjunto) +
+  labs(
+    title = "Comparación de RMSE entre Modelos",
+    x = "Modelo",
+    y = "RMSE",
+    fill = "Modelo"
+  ) +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+## 8.2 Análisis de residuos
+
+```{r residuos, eval=FALSE}
+# Calcular residuos
+residuos_rf <- pred_test_rf %>%
+  mutate(modelo = "Random Forest", residuo = .pred - PC1)
+
+residuos_bt <- pred_test_bt %>%
+  mutate(modelo = "XGBoost", residuo = .pred - PC1)
+
+residuos_comparados <- bind_rows(residuos_rf, residuos_bt)
+
+# Gráfico de residuos
+ggplot(residuos_comparados, aes(x = .pred, y = residuo, color = modelo)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~ modelo) +
+  labs(
+    title = "Residuos vs Predicción",
+    x = "Valor predicho de PC1",
+    y = "Residuo (predicho - observado)"
+  ) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+# 9. Interpretabilidad
+
+## 9.1 Importancia de variables
+
+```{r vip, eval=FALSE}
+# Random Forest
+vip(final_fit_rf$fit$fit, num_features = 15) +
+  ggtitle("Importancia de Variables - Random Forest") +
+  theme_minimal()
+
+# XGBoost
+vip(final_fit_bt$fit$fit, num_features = 15) +
+  ggtitle("Importancia de Variables - XGBoost") +
+  theme_minimal()
+```
+
+# 10. Conclusiones
+
+## Principales hallazgos
+
+1. **XGBoost** mostró mejor desempeño que Random Forest en términos de RMSE
+2. Las variables más importantes para predecir vulnerabilidad sanitaria fueron:
+   - Acceso a red cloacal
+   - Distancia al centroide del aglomerado
+   - Acceso a agua de red
+   - Proporción de hogares sin NBI
+3. La interacción entre aglomerado y distancia al centroide captura heterogeneidad territorial
+
+## Aplicaciones potenciales
+
+- Focalización de políticas de salud pública
+- Priorización de inversión en infraestructura sanitaria
+- Identificación de zonas de alta vulnerabilidad
+
+---
+
+*Trabajo desarrollado en el marco de la Especialización en Métodos Cuantitativos y Ciencias Sociales Computacionales - IDAES/UNSAM*
