@@ -74,9 +74,9 @@ Random Forest mostró mejor desempeño que XGBoost, con un RMSE de ~0.75 en test
 - Las condiciones de infraestructura básica (cloacas, agua de red) funcionan como proxies del nivel de integración territorial
 - Los modelos tienen limitaciones para predecir casos extremos (radios con peor accesibilidad), posiblemente por subrepresentación en el entrenamiento
 
-## Autores
+## Autora
 
-**Rocío Wegman** y **Nicolás Medina**
+**Rocío Wegman** 
 
 - 📧 rochiweg@gmail.com
 - 🔗 [LinkedIn - Rocío Wegman](https://www.linkedin.com/in/rocío-wegman-806643268/)
@@ -94,4 +94,3 @@ Trabajo final desarrollado en el marco de la **Especialización en Métodos Cuan
 
 *Este repositorio forma parte del portfolio de proyectos en ciencia de datos aplicada a políticas públicas.*
 
-*Este repositorio forma parte de mi portfolio de proyectos en ciencia de datos aplicada a políticas públicas.*
